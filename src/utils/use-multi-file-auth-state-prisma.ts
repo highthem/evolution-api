@@ -1,6 +1,7 @@
 import { prismaRepository } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { CacheConf, configService } from '@config/env.config';
+import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
 import { AuthenticationState, BufferJSON, initAuthCreds, WAProto as proto } from 'baileys';
 import fs from 'fs/promises';
@@ -19,7 +20,7 @@ export async function keyExists(sessionId: string): Promise<any> {
   try {
     const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
     return !!key;
-  } catch (error) {
+  } catch {
     return false;
   }
 }
@@ -38,7 +39,7 @@ export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
       where: { sessionId: sessionId },
       data: { creds: JSON.stringify(keyJson) },
     });
-  } catch (error) {
+  } catch {
     return null;
   }
 }
@@ -49,7 +50,7 @@ export async function getAuthKey(sessionId: string): Promise<any> {
     if (!register) return null;
     const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
     return JSON.parse(auth?.creds);
-  } catch (error) {
+  } catch {
     return null;
   }
 }
@@ -59,7 +60,7 @@ async function deleteAuthKey(sessionId: string): Promise<any> {
     const register = await keyExists(sessionId);
     if (!register) return;
     await prismaRepository.session.delete({ where: { sessionId: sessionId } });
-  } catch (error) {
+  } catch {
     return;
   }
 }
@@ -68,10 +69,12 @@ async function fileExists(file: string): Promise<any> {
   try {
     const stat = await fs.stat(file);
     if (stat.isFile()) return true;
-  } catch (error) {
+  } catch {
     return;
   }
 }
+
+const logger = new Logger('useMultiFileAuthStatePrisma');
 
 export default async function useMultiFileAuthStatePrisma(
   sessionId: string,
@@ -79,6 +82,7 @@ export default async function useMultiFileAuthStatePrisma(
 ): Promise<{
   state: AuthenticationState;
   saveCreds: () => Promise<void>;
+  removeCreds: () => Promise<void>;
 }> {
   const localFolder = path.join(INSTANCE_DIR, sessionId);
   const localFile = (key: string) => path.join(localFolder, fixFileName(key) + '.json');
@@ -119,7 +123,7 @@ export default async function useMultiFileAuthStatePrisma(
 
       const parsedData = JSON.parse(rawData, BufferJSON.reviver);
       return parsedData;
-    } catch (error) {
+    } catch {
       return null;
     }
   }
@@ -137,9 +141,29 @@ export default async function useMultiFileAuthStatePrisma(
       } else {
         await deleteAuthKey(sessionId);
       }
-    } catch (error) {
+    } catch {
       return;
     }
+  }
+
+  async function removeCreds(): Promise<any> {
+    const cacheConfig = configService.get<CacheConf>('CACHE');
+
+    // Redis
+    try {
+      if (cacheConfig.REDIS.ENABLED) {
+        await cache.delete(sessionId);
+        logger.info({ action: 'redis.delete', sessionId });
+
+        return;
+      }
+    } catch (err) {
+      logger.warn({ action: 'redis.delete', sessionId, err });
+    }
+
+    logger.info({ action: 'auth.key.delete', sessionId });
+
+    await deleteAuthKey(sessionId);
   }
 
   let creds = await readData('creds');
@@ -183,5 +207,7 @@ export default async function useMultiFileAuthStatePrisma(
     saveCreds: () => {
       return writeData(creds, 'creds');
     },
+
+    removeCreds,
   };
 }
